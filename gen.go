@@ -14,14 +14,11 @@ import (
 	"github.com/serenize/snaker"
 )
 
-// TODO:
-// - Generate files
-
 type typeThing struct {
-	name       string
-	definition *ast.StructType
-	parents    []ast.Expr
-	funcs      []*ast.FuncDecl
+	name           string
+	hasDeclaration bool
+	parents        []ast.Expr
+	funcs          []*ast.FuncDecl
 }
 
 var hasName = make(map[string]bool)
@@ -31,6 +28,9 @@ var knownPrefixes = make(map[string]bool)
 var currentImports = make(map[string]bool)
 
 var importStrings = make(map[string]string)
+
+var exclusions = make(map[string]bool)
+var excludeTypes = make(map[string]bool)
 
 func init() {
 	knownPrefixes["cairo"] = true
@@ -50,6 +50,11 @@ func init() {
 	importStrings["gtk_iface"] = "gtk_iface \"github.com/gotk3/gotk3/gtk/iface\""
 	importStrings["glib_iface"] = "glib_iface \"github.com/gotk3/gotk3/glib/iface\""
 	importStrings["pango_iface"] = "pango_iface \"github.com/gotk3/gotk3/pango/iface\""
+
+	exclusions["Glib::ClosureNew"] = true
+	exclusions["Glib::ToGObject"] = true
+	exclusions["*::Native"] = true
+	excludeTypes["Glib::Type"] = true
 }
 
 func (tt *typeThing) addFunc(f *ast.FuncDecl) {
@@ -107,6 +112,9 @@ func genType(f ast.Expr, withIface bool, withIfaceOther bool) string {
 		if knownPrefixes[pref] && withIfaceOther {
 			pref = pref + "_iface"
 		}
+		if pref == "iface" {
+			return ft.Sel.Name
+		}
 		currentImports[pref] = true
 		return pref + "." + ft.Sel.Name
 	case *ast.MapType:
@@ -125,21 +133,35 @@ func genType(f ast.Expr, withIface bool, withIfaceOther bool) string {
 	return ""
 }
 
-func genField(f *ast.Field, withNames bool, withIface bool, withIfaceOther bool) string {
-	if withNames {
-		return fmt.Sprintf("%s %s", f.Names[0].Name, genType(f.Type, withIface, withIfaceOther))
+func genField(f *ast.Field, withNames bool, withIface bool, withIfaceOther bool) []string {
+	result := []string{}
+
+	for _, name := range f.Names {
+		if withNames {
+			result = append(result, fmt.Sprintf("%s %s", name, genType(f.Type, withIface, withIfaceOther)))
+		} else {
+			result = append(result, genType(f.Type, withIface, withIfaceOther))
+		}
 	}
 
-	return genType(f.Type, withIface, withIfaceOther)
+	if len(result) == 0 && !withNames {
+		result = append(result, genType(f.Type, withIface, withIfaceOther))
+	}
+
+	return result
 }
 
-func genFieldArg(f *ast.Field) string {
+func genFieldArg(f *ast.Field) []string {
+	result := []string{}
 	_, ell := f.Type.(*ast.Ellipsis)
 	suffix := ""
 	if ell {
 		suffix = "..."
 	}
-	return fmt.Sprintf("%s%s", f.Names[0].Name, suffix)
+	for _, nm := range f.Names {
+		result = append(result, fmt.Sprintf("%s%s", nm, suffix))
+	}
+	return result
 }
 
 func genResults(f *ast.FieldList, withIface bool, withIfaceOther bool) string {
@@ -147,7 +169,7 @@ func genResults(f *ast.FieldList, withIface bool, withIfaceOther bool) string {
 
 	if f != nil && f.List != nil {
 		for _, field := range f.List {
-			result = append(result, genField(field, false, withIface, withIfaceOther))
+			result = append(result, genField(field, false, withIface, withIfaceOther)...)
 		}
 	}
 
@@ -165,7 +187,7 @@ func genParams(f *ast.FieldList, withNames bool, withIface bool, withIfaceOther 
 	result := []string{}
 
 	for _, field := range f.List {
-		result = append(result, genField(field, withNames, withIface, withIfaceOther))
+		result = append(result, genField(field, withNames, withIface, withIfaceOther)...)
 	}
 
 	return strings.Join(result, ", ")
@@ -175,7 +197,7 @@ func genFuncArgs(fd *ast.FuncType) string {
 	result := []string{}
 
 	for _, field := range fd.Params.List {
-		result = append(result, genFieldArg(field))
+		result = append(result, genFieldArg(field)...)
 	}
 
 	return strings.Join(result, ", ")
@@ -213,7 +235,7 @@ func addParents(f *ast.FieldList, tt *typeThing) {
 	}
 }
 
-func collectAllFrom(dir string) map[string]*typeThing {
+func collectAllFrom(dir, iname string) map[string]*typeThing {
 	fset := token.NewFileSet()
 
 	typeThings := make(map[string]*typeThing)
@@ -223,7 +245,7 @@ func collectAllFrom(dir string) map[string]*typeThing {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-
+	getOrCreateTypeThing(typeThings, "<global>").hasDeclaration = true
 	for _, pa := range f {
 		for fn, ff := range pa.Files {
 			if !strings.HasSuffix(fn, "_test.go") && !strings.Contains(fn, "_since_") {
@@ -241,7 +263,16 @@ func collectAllFrom(dir string) map[string]*typeThing {
 									recv = bla.Name
 								}
 							}
-							getOrCreateTypeThing(typeThings, recv).addFunc(ss)
+							realName := recv
+							if realName == "<global>" {
+								realName = iname
+							}
+							fullName := fmt.Sprintf("%s::%s", realName, ss.Name.Name)
+							if !exclusions[fullName] && !exclusions[fmt.Sprintf("*::%s", ss.Name.Name)] {
+								getOrCreateTypeThing(typeThings, recv).addFunc(ss)
+							} else {
+								fmt.Printf("Excluding: %s\n", fullName)
+							}
 						}
 					case *ast.GenDecl:
 						switch ss.Tok {
@@ -252,8 +283,8 @@ func collectAllFrom(dir string) map[string]*typeThing {
 									switch st := sss.Type.(type) {
 									case *ast.StructType:
 										tt := getOrCreateTypeThing(typeThings, sss.Name.Name)
+										tt.hasDeclaration = true
 										hasName[sss.Name.Name] = true
-										tt.definition = st
 										addParents(st.Fields, tt)
 									}
 								}
@@ -306,7 +337,7 @@ func exportInterface(name string, tp *typeThing, outDir, pname string) {
 	for ki := range currentImports {
 		is, ok := importStrings[ki]
 		if !ok {
-			is = ki
+			is = "\"" + ki + "\""
 		}
 		fmt.Fprintf(realOut, "import %s\n", is)
 	}
@@ -315,7 +346,7 @@ func exportInterface(name string, tp *typeThing, outDir, pname string) {
 
 func exportAllInterfaces(typeThings map[string]*typeThing, outDir, pname string) {
 	for _, tp := range sortedTypeThings(typeThings) {
-		if tp.name != "<global>" {
+		if tp.name != "<global>" && tp.hasDeclaration {
 			exportInterface(tp.name, tp, outDir, pname)
 		}
 	}
@@ -363,7 +394,7 @@ func exportGlobalImpl(typeThings map[string]*typeThing, iname, pname, proot, out
 		for ki := range currentImports {
 			is, ok := importStrings[ki]
 			if !ok {
-				is = ki
+				is = "\"" + ki + "\""
 			}
 			fmt.Fprintf(realOut, "import %s\n", is)
 		}
@@ -394,13 +425,15 @@ func exportTesterFile(typeThings map[string]*typeThing, iname, pname, proot, out
 	fmt.Fprintf(out, "func init() {\n")
 
 	for _, tp := range sortedTypeThings(typeThings) {
-		name := tp.name
-		testName := tp.name
-		if name == "<global>" {
-			name = iname
-			testName = "Real" + iname
+		if tp.hasDeclaration {
+			name := tp.name
+			testName := tp.name
+			if name == "<global>" {
+				name = iname
+				testName = "Real" + iname
+			}
+			fmt.Fprintf(out, "  iface.Assert%s(&%s{})\n", name, testName)
 		}
-		fmt.Fprintf(out, "  iface.Assert%s(&%s{})\n", name, testName)
 	}
 	fmt.Fprintf(out, "}\n")
 }
@@ -417,7 +450,7 @@ func main() {
 	pname := os.Args[4]
 	outDir := os.Args[5]
 
-	typeThings := collectAllFrom(fromDir)
+	typeThings := collectAllFrom(fromDir, ifname)
 
 	exportAllInterfaces(typeThings, outDir, pname)
 	exportGlobalInterface(typeThings, ifname, outDir, pname)
