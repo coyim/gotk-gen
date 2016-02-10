@@ -54,6 +54,7 @@ func init() {
 	exclusions["Glib::ClosureNew"] = true
 	exclusions["Glib::ToGObject"] = true
 	exclusions["*::Native"] = true
+	exclusions["Context::GetCContext"] = true
 	excludeTypes["Glib::Type"] = true
 }
 
